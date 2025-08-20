@@ -1066,6 +1066,5 @@ def main():
 
     print("\nTraining completed successfully!")
 
-
 if __name__ == "__main__":
     main()
