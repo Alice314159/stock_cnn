@@ -1300,7 +1300,7 @@ class OptimizedStockDataset(Dataset):
             sequence = self.transform(sequence)
         
         # Window-wise normalization for better training stability
-        sequence = self._normalize_window(sequence)
+        #sequence = self._normalize_window(sequence)
         
         # Final safety check before returning
         if np.any(safe_isnan(sequence)):
@@ -2358,7 +2358,6 @@ def optimize_hyperparameters(df: pd.DataFrame, n_trials: int = 100) -> Dict[str,
 
 def main():
     """Main execution function"""
-    logger.add("optimized_stock_cnn_{time}.log", rotation="10 MB", level="INFO")
     logger.info("Starting Optimized Stock CNN Pipeline")
     
     # Configuration
