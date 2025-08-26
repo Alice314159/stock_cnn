@@ -1,19 +1,22 @@
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
 from loguru import logger
+import os
+import pickle
 
 
 class MultiStockSequenceDataset(Dataset):
     """
-    多股票序列数据集
+    多股票序列数据集 - 支持延迟加载以节省内存
     
     功能:
     1. 将多股票数据转换为适合CNN-LSTM模型的序列格式
     2. 支持股票索引，用于多股票模型
     3. 支持滑动窗口和步长设置
+    4. 支持延迟加载和内存优化
     """
     
     def __init__(self, 
@@ -23,7 +26,9 @@ class MultiStockSequenceDataset(Dataset):
                  stride: int = 1,
                  stock_id_column: str = "stock_code",
                  stock_idx_column: str = "stock_index",
-                 label_column: str = "label"):
+                 label_column: str = "label",
+                 use_lazy_loading: bool = True,
+                 cache_dir: Optional[str] = None):
         
         self.data = data
         self.feature_columns = feature_columns
@@ -32,6 +37,8 @@ class MultiStockSequenceDataset(Dataset):
         self.stock_id_column = stock_id_column
         self.stock_idx_column = stock_idx_column
         self.label_column = label_column
+        self.use_lazy_loading = use_lazy_loading
+        self.cache_dir = cache_dir
         
         # 检查必要的列是否存在
         missing_columns = []
@@ -53,14 +60,16 @@ class MultiStockSequenceDataset(Dataset):
         logger.info(f"  列名: {list(data.columns)}")
         logger.info(f"  股票索引范围: {data[self.stock_idx_column].min()} - {data[self.stock_idx_column].max()}")
         logger.info(f"  标签分布: {data[self.label_column].value_counts().to_dict()}")
+        logger.info(f"  延迟加载: {'启用' if use_lazy_loading else '禁用'}")
         
         # 构建索引
         self.indices = self._build_indices()
         
-        # 转换为numpy数组以提高性能
-        self.feature_data = data[feature_columns].values.astype(np.float32)
-        self.stock_indices = data[stock_idx_column].values.astype(np.int64)
-        self.labels = data[label_column].values.astype(np.int64)
+        # 根据延迟加载策略选择数据存储方式
+        if use_lazy_loading:
+            self._setup_lazy_loading()
+        else:
+            self._setup_eager_loading()
         
         logger.info(f"数据集大小: {len(self.indices)}")
         logger.info(f"特征数量: {len(feature_columns)}")
@@ -143,7 +152,10 @@ class MultiStockSequenceDataset(Dataset):
             raise IndexError(f"计算出的索引范围[{start_idx}, {end_idx}]超出数据范围[0, {len(self.data)-1}]")
         
         # 提取特征序列
-        sequence = self.feature_data[start_idx:end_idx + 1]  # (window_size, num_features)
+        if self.use_lazy_loading:
+            sequence = self._extract_features_lazy(start_idx, end_idx)
+        else:
+            sequence = self.feature_data[start_idx:end_idx + 1]  # (window_size, num_features)
         
         # 转换为CNN输入格式 (C=1, H=window_size, W=num_features)
         sequence = sequence[None, :, :]  # (1, window_size, num_features)
@@ -179,6 +191,11 @@ class MultiStockSequenceDataset(Dataset):
             特征统计信息字典
         """
         stats = {}
+        if self.use_lazy_loading:
+            # 延迟加载模式下，特征数据不在内存中，无法直接计算统计
+            logger.warning("延迟加载模式下无法获取特征统计，因为特征数据未加载到内存。")
+            return {}
+        
         for i, col in enumerate(self.feature_columns):
             values = self.feature_data[:, i]
             stats[col] = {
@@ -189,31 +206,65 @@ class MultiStockSequenceDataset(Dataset):
             }
         return stats
 
+    def _setup_lazy_loading(self):
+        """设置延迟加载"""
+        # 只存储必要的元数据，不加载特征数据到内存
+        self.feature_data = None
+        self.stock_indices = self.data[self.stock_idx_column].values.astype(np.int64)
+        self.labels = self.data[self.label_column].values.astype(np.int64)
+        
+        # 创建特征列索引映射
+        self.feature_col_indices = {col: i for i, col in enumerate(self.feature_columns)}
+        
+        logger.info("延迟加载模式：特征数据将在需要时从DataFrame中提取")
+    
+    def _setup_eager_loading(self):
+        """设置即时加载（传统模式）"""
+        # 转换为numpy数组以提高性能
+        self.feature_data = self.data[self.feature_columns].values.astype(np.float32)
+        self.stock_indices = self.data[self.stock_idx_column].values.astype(np.int64)
+        self.labels = self.data[self.label_column].values.astype(np.int64)
+        
+        logger.info("即时加载模式：所有特征数据已加载到内存")
+    
+    def _extract_features_lazy(self, start_idx: int, end_idx: int) -> np.ndarray:
+        """延迟加载特征数据"""
+        if self.feature_data is not None:
+            # 如果已经加载，直接使用
+            return self.feature_data[start_idx:end_idx + 1]
+        
+        # 从DataFrame中提取特征
+        features = []
+        for i in range(start_idx, end_idx + 1):
+            row_features = []
+            for col in self.feature_columns:
+                value = self.data.iloc[i][col]
+                # 处理NaN和无穷大值
+                if pd.isna(value) or np.isinf(value):
+                    value = 0.0
+                row_features.append(float(value))
+            features.append(row_features)
+        
+        return np.array(features, dtype=np.float32)
+
 
 class MultiStockBatchSampler:
     """
-    多股票批次采样器
+    简化的多股票批次采样器
     
-    确保每个批次包含来自不同股票的样本，提高训练稳定性
-    处理样本数量少的股票，避免空批次
+    使用PyTorch内置优化选项，减少复杂度
     """
     
-    def __init__(self, dataset: MultiStockSequenceDataset, batch_size: int, shuffle: bool = True, 
-                 min_samples_per_stock: int = 1, oversample_small_stocks: bool = True):
+    def __init__(self, dataset: MultiStockSequenceDataset, batch_size: int, shuffle: bool = True):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.min_samples_per_stock = min_samples_per_stock
-        self.oversample_small_stocks = oversample_small_stocks
         
         # 按股票分组索引
         self.stock_groups = self._group_by_stock()
         
-        # 过滤和预处理股票组
-        self.processed_groups = self._process_stock_groups()
-        
-        logger.info(f"批次采样器初始化: {len(self.processed_groups)}个有效股票组")
-        for stock_id, indices in self.processed_groups.items():
+        logger.info(f"批次采样器初始化: {len(self.stock_groups)}个股票组")
+        for stock_id, indices in self.stock_groups.items():
             logger.info(f"股票{stock_id}: {len(indices)}个样本")
     
     def _group_by_stock(self) -> Dict[int, List[int]]:
@@ -226,40 +277,19 @@ class MultiStockBatchSampler:
             groups[stock_idx].append(i)
         return groups
     
-    def _process_stock_groups(self) -> Dict[int, List[int]]:
-        """处理股票组，过滤样本太少的股票，对样本少的股票进行过采样"""
-        processed_groups = {}
-        
-        for stock_id, indices in self.stock_groups.items():
-            if len(indices) >= self.min_samples_per_stock:
-                if self.oversample_small_stocks and len(indices) < self.batch_size:
-                    # 对样本少的股票进行过采样，确保至少有batch_size个样本
-                    oversampled_indices = []
-                    while len(oversampled_indices) < self.batch_size:
-                        oversampled_indices.extend(indices)
-                    processed_groups[stock_id] = oversampled_indices[:self.batch_size]
-                    logger.info(f"股票{stock_id}: 原始{len(indices)}个样本，过采样到{len(processed_groups[stock_id])}个")
-                else:
-                    processed_groups[stock_id] = indices.copy()
-            else:
-                logger.warning(f"股票{stock_id}样本数量({len(indices)})少于最小要求({self.min_samples_per_stock})，已过滤")
-        
-        return processed_groups
-    
     def __iter__(self):
         """生成批次索引"""
-        if not self.processed_groups:
-            logger.warning("没有有效的股票组，无法生成批次")
+        if not self.stock_groups:
             return
         
         # 获取所有股票ID
-        stock_ids = list(self.processed_groups.keys())
+        stock_ids = list(self.stock_groups.keys())
         
         if self.shuffle:
             np.random.shuffle(stock_ids)
         
         # 为每个股票创建索引列表
-        stock_indices = {stock_id: self.processed_groups[stock_id].copy() for stock_id in stock_ids}
+        stock_indices = {stock_id: self.stock_groups[stock_id].copy() for stock_id in stock_ids}
         
         # 如果shuffle，打乱每个股票内部的索引
         if self.shuffle:
@@ -289,15 +319,15 @@ class MultiStockBatchSampler:
     
     def __len__(self):
         """计算总批次数"""
-        total_samples = sum(len(indices) for indices in self.processed_groups.values())
+        total_samples = sum(len(indices) for indices in self.stock_groups.values())
         return (total_samples + self.batch_size - 1) // self.batch_size
 
 
 class MultiStockDataLoader:
     """
-    多股票数据加载器
+    优化的多股票数据加载器
     
-    包装PyTorch的DataLoader，提供多股票特定的功能
+    使用PyTorch内置优化选项
     """
     
     def __init__(self, 
@@ -306,30 +336,33 @@ class MultiStockDataLoader:
                  shuffle: bool = True,
                  num_workers: int = 0,
                  pin_memory: bool = True,
-                 min_samples_per_stock: int = 1,
-                 oversample_small_stocks: bool = True):
+                 persistent_workers: bool = True,
+                 prefetch_factor: int = 2,
+                 non_blocking: bool = True):
         
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.min_samples_per_stock = min_samples_per_stock
-        self.oversample_small_stocks = oversample_small_stocks
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
+        self.non_blocking = non_blocking
         
         # 创建批次采样器
-        self.batch_sampler = MultiStockBatchSampler(
-            dataset, batch_size, shuffle, 
-            min_samples_per_stock, oversample_small_stocks
-        )
+        self.batch_sampler = MultiStockBatchSampler(dataset, batch_size, shuffle)
         
-        # 创建DataLoader
+        # 创建DataLoader，使用PyTorch优化选项
         self.dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_sampler=self.batch_sampler,
             num_workers=num_workers,
-            pin_memory=pin_memory
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers and num_workers > 0,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None
         )
+        
+        logger.info(f"数据加载器初始化: workers={num_workers}, persistent={persistent_workers}, prefetch={prefetch_factor}")
     
     def __iter__(self):
         return iter(self.dataloader)

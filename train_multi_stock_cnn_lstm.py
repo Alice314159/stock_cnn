@@ -15,6 +15,7 @@ import argparse
 import random
 from pathlib import Path
 from typing import Dict,List, Any, Optional
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix
 from loguru import logger
+import pickle
 
 # 添加src目录到Python路径
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -243,222 +245,198 @@ def check_and_fix_model_weights(model: nn.Module) -> bool:
             has_nan = True
     return has_nan
 
-def train_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    scaler: Optional[GradScaler],
-    use_amp: bool,
-    data_augmenter: Optional[StockDataAugmentation] = None,
-    scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
-) -> Dict[str, float]:
-    """训练一个epoch（修复缩进、去除 .data、按批可选调度器步进）"""
+def train_epoch(model, dataloader, criterion, optimizer, scaler, data_augmenter, device, epoch, 
+                gradient_monitor, adaptive_clipper, accumulation_steps):
+    """训练一个epoch，支持梯度累积"""
     model.train()
     total_loss = 0.0
-    correct = 0
-    total = 0
-
-    use_amp = bool(use_amp and device.type == "cuda")
-
+    correct_predictions = 0
+    total_predictions = 0
+    
+    # 梯度累积相关
+    optimizer.zero_grad()
+    accumulation_counter = 0
+    
     for batch_idx, (data, stock_indices, targets) in enumerate(dataloader):
-        # 数据验证：检查输入数据是否有效
+        # 数据验证
         if torch.isnan(data).any() or torch.isinf(data).any():
             logger.warning(f"Batch {batch_idx}: 输入数据包含NaN或Inf值，跳过此batch")
             continue
-            
         if torch.isnan(targets).any() or torch.isinf(targets).any():
             logger.warning(f"Batch {batch_idx}: 目标数据包含NaN或Inf值，跳过此batch")
             continue
         
-        data = data.to(device, non_blocking=True)
-        stock_indices = stock_indices.to(device, non_blocking=True)
-        targets = targets.to(device, non_blocking=True)
-
-        # 50% 概率数据增强
+        # 数据增强
         if data_augmenter is not None and torch.rand(1).item() < 0.5:
             try:
-                # 增强前检查数据
+                original_data = data.clone()
+                data = data_augmenter.apply_augmentation_pipeline(data, augmentation_prob=0.3)
                 if torch.isnan(data).any() or torch.isinf(data).any():
-                    logger.warning(f"Batch {batch_idx}: 数据增强前数据无效，跳过增强")
-                else:
-                    original_data = data.clone()  # 保存原始数据
-                    data = data_augmenter.apply_augmentation_pipeline(data, augmentation_prob=0.3)
-                    # 增强后检查数据
-                    if torch.isnan(data).any() or torch.isinf(data).any():
-                        logger.warning(f"Batch {batch_idx}: 数据增强后产生无效值，使用原始数据")
-                        data = original_data  # 使用原始数据
+                    logger.warning(f"Batch {batch_idx}: 数据增强后产生无效值，使用原始数据")
+                    data = original_data
             except Exception as e:
                 logger.warning(f"数据增强失败: {e}")
-
-        optimizer.zero_grad(set_to_none=True)
-
-        if use_amp and scaler is not None:
-            # PyTorch 2.x: torch.amp.autocast(device_type=...)
-            with autocast(device_type="cuda"):
-                outputs = model(data, stock_indices)
-                loss = criterion(outputs, targets)
-            scaler.scale(loss).backward()
-            # 更激进的梯度裁剪，防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 从1.0降低到0.5
+                data = original_data
+        
+        # 移动到设备
+        data = data.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        stock_indices = stock_indices.to(device, non_blocking=True)
+        
+        # 前向传播
+        try:
+            outputs = model(data, stock_indices)
+        except ValueError as e:
+            logger.error(f"模型前向传播失败: {e}")
+            continue
+        
+        # 计算损失
+        loss = criterion(outputs, targets)
+        
+        # 检查损失值
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.error(f"Loss异常: {loss.item()}")
+            continue
+        
+        # 反向传播 - 支持梯度累积
+        if scaler is not None:
+            # 混合精度训练
+            scaled_loss = loss / accumulation_steps
+            scaler.scale(scaled_loss).backward()
+        else:
+            # 标准训练
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
+        
+        # 累积梯度
+        accumulation_counter += 1
+        
+        if accumulation_counter >= accumulation_steps:
+            # 执行参数更新
+            if scaler is not None:
+                # 自适应梯度裁剪
+                adaptive_clipper.clip_gradients(model)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 自适应梯度裁剪
+                adaptive_clipper.clip_gradients(model)
+                optimizer.step()
+            
+            # 更新梯度监控
+            gradient_stats = gradient_monitor.update(model, batch_idx)
+            
+            # 重置梯度
+            optimizer.zero_grad()
+            accumulation_counter = 0
+        
+        # 统计
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total_predictions += targets.size(0)
+        correct_predictions += (predicted == targets).sum().item()
+        
+        # 打印进度
+        if batch_idx % 10 == 0:
+            logger.info(f"Epoch {epoch+1}, Batch {batch_idx}/{len(dataloader)}, "
+                       f"Loss: {loss.item():.4f}, Acc: {100*correct_predictions/total_predictions:.2f}%")
+    
+    # 处理剩余的梯度
+    if accumulation_counter > 0:
+        if scaler is not None:
+            adaptive_clipper.clip_gradients(model)
             scaler.step(optimizer)
             scaler.update()
-            
-            # 检查并修复模型权重
-            if check_and_fix_model_weights(model):
-                logger.warning(f"Batch {batch_idx}: 检测到NaN权重，已修复")
         else:
-            outputs = model(data, stock_indices)
-            loss = criterion(outputs, targets)
-            
-            # 检查loss是否为nan或inf
-            if torch.isnan(loss) or torch.isinf(loss):
-                logger.error(f"Loss异常: {loss.item()}")
-                logger.error(f"Outputs stats - min: {outputs.min()}, max: {outputs.max()}, mean: {outputs.mean()}")
-                logger.error(f"Targets stats - min: {targets.min()}, max: {targets.max()}, mean: {targets.float().mean()}")
-                logger.error(f"Data stats - min: {data.min()}, max: {data.max()}, mean: {data.mean()}")
-                
-                # 降低学习率以稳定训练
-                for param_group in optimizer.param_groups:
-                    param_group['lr'] *= 0.5
-                    logger.warning(f"降低学习率到: {param_group['lr']}")
-                
-                # 跳过这个batch
-                continue
-            
-            loss.backward()
-            # 更激进的梯度裁剪，防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)  # 从1.0降低到0.5
+            adaptive_clipper.clip_gradients(model)
             optimizer.step()
-            
-            # 检查并修复模型权重
-            if check_and_fix_model_weights(model):
-                logger.warning(f"Batch {batch_idx}: 检测到NaN权重，已修复")
-
-        total_loss += loss.item()
-
-        # —— metrics（避免 .data；放在 no_grad）——
-        with torch.no_grad():
-            pred = outputs.argmax(dim=1)
-            correct += (pred == targets).sum().item()
-            total += targets.size(0)
-
-        # —— 若使用按批调度器（如 OneCycleLR），这里 step —— 
-        if isinstance(scheduler, optim.lr_scheduler.OneCycleLR):
-            scheduler.step()
-
-        if batch_idx % 100 == 0:
-            logger.info(f"Batch {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}")
-
-    avg_loss = total_loss / max(1, len(dataloader))
-    accuracy = 100.0 * correct / max(1, total)
-    return {"loss": avg_loss, "accuracy": accuracy}
+        optimizer.zero_grad()
+    
+    # 计算平均指标
+    avg_loss = total_loss / len(dataloader)
+    accuracy = 100 * correct_predictions / total_predictions if total_predictions > 0 else 0
+    
+    return avg_loss, {'loss': avg_loss, 'accuracy': accuracy}
 
 
  
-def validate_epoch(model: nn.Module,
-                  dataloader: DataLoader,
-                  criterion: nn.Module,
-                  device: torch.device,
-                  stock_ids: Optional[List[str]] = None) -> Dict[str, float]:
-    """验证一个epoch（包含PR-AUC和per-stock指标）"""
+def validate_epoch(model, dataloader, criterion, device, epoch):
+    """验证一个epoch"""
     model.eval()
     total_loss = 0.0
-    correct = 0
-    total = 0
+    correct_predictions = 0
+    total_predictions = 0
     
-    all_predictions = []
-    all_targets = []
-    all_stock_indices = []
-    
-    # 收集每个batch的预测结果和股票索引
     with torch.no_grad():
-        for data, stock_indices, targets in dataloader:
-            data = data.to(device)
-            stock_indices = stock_indices.to(device)
-            targets = targets.to(device)
+        for batch_idx, (data, stock_indices, targets) in enumerate(dataloader):
+            # 数据验证
+            if torch.isnan(data).any() or torch.isinf(data).any():
+                logger.warning(f"验证Batch {batch_idx}: 输入数据包含NaN或Inf值，跳过此batch")
+                continue
             
-            outputs = model(data, stock_indices)
+            # 移动到设备
+            data = data.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            stock_indices = stock_indices.to(device, non_blocking=True)
+            
+            # 前向传播
+            try:
+                outputs = model(data, stock_indices)
+            except ValueError as e:
+                logger.error(f"验证时模型前向传播失败: {e}")
+                continue
+            
+            # 计算损失
             loss = criterion(outputs, targets)
             
+            # 统计
             total_loss += loss.item()
-            
-            # 计算准确率
             _, predicted = torch.max(outputs.data, 1)
-            total += targets.size(0)
-            correct += (predicted == targets).sum().item()
-            
-            # 收集预测结果和股票索引
-            all_predictions.extend(predicted.cpu().numpy())
-            all_targets.extend(targets.cpu().numpy())
-            all_stock_indices.extend(stock_indices.cpu().numpy())
+            total_predictions += targets.size(0)
+            correct_predictions += (predicted == targets).sum().item()
     
+    # 计算平均指标
     avg_loss = total_loss / len(dataloader)
-    accuracy = 100.0 * correct / total
+    accuracy = 100 * correct_predictions / total_predictions if total_predictions > 0 else 0
     
-    # 计算整体指标
-    from sklearn.metrics import f1_score, average_precision_score, precision_recall_curve, auc
+    return avg_loss, {'loss': avg_loss, 'accuracy': accuracy}
+
+
+def save_checkpoint(model, optimizer, epoch, loss, score, checkpoint_dir, name):
+    """保存检查点"""
+    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
     
-    # F1分数
-    f1_macro = f1_score(all_targets, all_predictions, average='macro')
-    f1_weighted = f1_score(all_targets, all_predictions, average='weighted')
-    
-    # PR-AUC (Precision-Recall AUC)
-    try:
-        # 获取正类的预测概率
-        all_probs = torch.softmax(torch.tensor(all_predictions, dtype=torch.float32), dim=0).numpy()
-        pr_auc = average_precision_score(all_targets, all_probs)
-    except:
-        pr_auc = 0.0
-    
-    # 计算per-stock指标
-    per_stock_metrics = {}
-    if stock_ids is not None:
-        for stock_idx, stock_id in enumerate(stock_ids):
-            stock_mask = [i == stock_idx for i in all_stock_indices]
-            if sum(stock_mask) > 0:  # 确保该股票有数据
-                stock_targets = [all_targets[i] for i, mask in enumerate(stock_mask) if mask]
-                stock_preds = [all_predictions[i] for i, mask in enumerate(stock_mask) if mask]
-                
-                if len(set(stock_targets)) > 1:  # 确保有多个类别
-                    stock_f1 = f1_score(stock_targets, stock_preds, average='macro')
-                    stock_acc = 100.0 * sum(1 for t, p in zip(stock_targets, stock_preds) if t == p) / len(stock_targets)
-                    
-                    per_stock_metrics[f"stock_{stock_id}_f1"] = stock_f1
-                    per_stock_metrics[f"stock_{stock_id}_acc"] = stock_acc
-    
-    # 计算per-stock指标的统计信息
-    if per_stock_metrics:
-        stock_f1s = [v for k, v in per_stock_metrics.items() if 'f1' in k]
-        stock_accs = [v for k, v in per_stock_metrics.items() if 'acc' in k]
-        
-        per_stock_metrics.update({
-            "stock_f1_mean": np.mean(stock_f1s),
-            "stock_f1_std": np.std(stock_f1s),
-            "stock_acc_mean": np.mean(stock_accs),
-            "stock_acc_std": np.std(stock_accs)
-        })
-    
-    metrics = {
-        "loss": avg_loss,
-        "accuracy": accuracy,
-        "f1_macro": f1_macro,
-        "f1_weighted": f1_weighted,
-        "pr_auc": pr_auc,
-        "val_f1_macro": f1_macro,  # 保持向后兼容
-        **per_stock_metrics
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'score': score,
+        'timestamp': datetime.now().isoformat()
     }
     
-    return metrics
+    file_path = checkpoint_path / f"{name}_model.pth"
+    torch.save(checkpoint, file_path)
+    logger.info(f"检查点已保存: {file_path}")
+
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    """加载检查点"""
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    score = checkpoint['score']
+    logger.info(f"检查点已加载: epoch {epoch}, score {score}")
+    return epoch, score
 
 
 def main():
-    data_folder = r"F:\VesperSet\stock_data_analysis\data\raw\HSTest"
+    
     """主函数"""
     parser = argparse.ArgumentParser(description="多股票CNN-LSTM模型训练")
     parser.add_argument("--config", type=str, default="", help="配置文件路径")
-    parser.add_argument("--data-folder", type=str, default=data_folder, help="股票数据文件夹")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数")
     parser.add_argument("--batch-size", type=int, default=64, help="批次大小")
     parser.add_argument("--lr", type=float, default=1e-3, help="学习率")
@@ -478,7 +456,7 @@ def main():
         batch_size=args.batch_size,
         learning_rate=args.lr
     )
-    data_config = DataConfig(data_folder=args.data_folder)
+    data_config = DataConfig()
     
     # 如果指定了num_workers，使用命令行参数；否则使用默认配置
     num_workers = args.num_workers if args.num_workers is not None else ExperimentConfig.num_workers
@@ -574,15 +552,18 @@ def main():
         # 创建数据集
         train_dataset = MultiStockSequenceDataset(
             train_data, feature_columns, data_config.window_size, data_config.stride,
-            stock_idx_column="stock_index", label_column="label"
+            stock_idx_column="stock_index", label_column="label",
+            use_lazy_loading=True  # 启用延迟加载以节省内存
         )
         val_dataset = MultiStockSequenceDataset(
             val_data, feature_columns, data_config.window_size, data_config.stride,
-            stock_idx_column="stock_index", label_column="label"
+            stock_idx_column="stock_index", label_column="label",
+            use_lazy_loading=True
         )
         test_dataset = MultiStockSequenceDataset(
             test_data, feature_columns, data_config.window_size, data_config.stride,
-            stock_idx_column="stock_index", label_column="label"
+            stock_idx_column="stock_index", label_column="label",
+            use_lazy_loading=True
         )
         
         # 数据增强配置
@@ -605,18 +586,30 @@ def main():
             data_augmenter = None
             logger.info("禁用数据增强功能")
         
-        # 创建数据加载器
+        # 创建数据加载器 - 使用新的优化选项
         train_loader = MultiStockDataLoader(
             train_dataset, training_config.batch_size, shuffle=True,
-            num_workers=experiment_config.num_workers, pin_memory=experiment_config.pin_memory
+            num_workers=experiment_config.num_workers, 
+            pin_memory=experiment_config.pin_memory,
+            persistent_workers=True,  # 启用持久化workers
+            prefetch_factor=2,        # 预取因子
+            non_blocking=True         # 非阻塞传输
         )
         val_loader = MultiStockDataLoader(
             val_dataset, training_config.batch_size, shuffle=False,
-            num_workers=experiment_config.num_workers, pin_memory=experiment_config.pin_memory
+            num_workers=experiment_config.num_workers, 
+            pin_memory=experiment_config.pin_memory,
+            persistent_workers=True,
+            prefetch_factor=2,
+            non_blocking=True
         )
         test_loader = MultiStockDataLoader(
             test_dataset, training_config.batch_size, shuffle=False,
-            num_workers=experiment_config.num_workers, pin_memory=experiment_config.pin_memory
+            num_workers=experiment_config.num_workers, 
+            pin_memory=experiment_config.pin_memory,
+            persistent_workers=True,
+            prefetch_factor=2,
+            non_blocking=True
         )
         
         # 创建模型
@@ -660,6 +653,27 @@ def main():
         # 创建混合精度训练器
         scaler = GradScaler() if training_config.use_amp else None
         
+        # 创建梯度监控器和自适应裁剪器
+        from src.training.gradient_monitor import GradientMonitor, AdaptiveGradientClipper
+        
+        gradient_monitor = GradientMonitor(
+            history_size=100,
+            spike_threshold=10.0,
+            vanish_threshold=1e-8
+        )
+        
+        adaptive_clipper = AdaptiveGradientClipper(
+            initial_norm=0.5,
+            percentile=95.0,
+            min_norm=0.1,
+            max_norm=5.0
+        )
+        
+        # 梯度累积配置
+        accumulation_steps = 4  # 每4个batch更新一次参数
+        effective_batch_size = training_config.batch_size * accumulation_steps
+        logger.info(f"梯度累积: {accumulation_steps}步, 有效批次大小: {effective_batch_size}")
+        
         # 训练循环
         best_val_score = 0.0
         patience_counter = 0
@@ -667,88 +681,95 @@ def main():
         logger.info("开始训练...")
         
         for epoch in range(training_config.epochs):
-            logger.info(f"Epoch {epoch+1}/{training_config.epochs}")
-            
-            # 训练
-            train_metrics = train_epoch(
-                model, train_loader, optimizer, criterion, device, scaler, training_config.use_amp, data_augmenter
+            # 训练阶段
+            train_loss, train_metrics = train_epoch(
+                model, train_loader, criterion, optimizer, scaler, 
+                data_augmenter, device, epoch, 
+                gradient_monitor, adaptive_clipper, accumulation_steps
             )
             
-            # 验证
-            val_metrics = validate_epoch(model, val_loader, criterion, device)
+            # 验证阶段
+            val_loss, val_metrics = validate_epoch(
+                model, val_loader, criterion, device, epoch
+            )
             
             # 学习率调度
             if scheduler is not None:
                 scheduler.step()
             
             # 记录指标
-            logger.info(f"训练 - Loss: {train_metrics['loss']:.4f}, Accuracy: {train_metrics['accuracy']:.2f}%")
-            logger.info(f"验证 - Loss: {val_metrics['loss']:.4f}, Accuracy: {val_metrics['accuracy']:.2f}%, F1: {val_metrics['f1_macro']:.4f}")
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.info(f"Epoch {epoch+1}/{training_config.epochs} - "
+                       f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                       f"LR: {current_lr:.6f}")
             
             # 早停检查
-            val_score = val_metrics[training_config.monitor]
-            if training_config.monitor_mode == "max":
-                if val_score > best_val_score:
-                    best_val_score = val_score
-                    patience_counter = 0
-                    
-                    # 保存最佳模型
-                    checkpoint_dir = Path(experiment_config.checkpoint_dir)
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_score': val_score,
-                        'config': {
-                            'model': model_config,
-                            'training': training_config,
-                            'data': data_config
-                        }
-                    }, checkpoint_dir / "best_model.pth")
-                    logger.info("保存最佳模型")
-                else:
-                    patience_counter += 1
+            if val_metrics['accuracy'] > best_val_score:
+                best_val_score = val_metrics['accuracy']
+                patience_counter = 0
+                # 保存最佳模型
+                save_checkpoint(model, optimizer, epoch, val_loss, best_val_score, 
+                              experiment_config.checkpoint_dir, "best")
             else:
-                if val_score < best_val_score:
-                    best_val_score = val_score
-                    patience_counter = 0
-                    
-                    # 保存最佳模型
-                    checkpoint_dir = Path(experiment_config.checkpoint_dir)
-                    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'val_score': val_score,
-                        'config': {
-                            'model': model_config,
-                            'training': training_config,
-                            'data': data_config
-                        }
-                    }, checkpoint_dir / "best_model.pth")
-                    logger.info("保存最佳模型")
-                else:
-                    patience_counter += 1
+                patience_counter += 1
+                if patience_counter >= training_config.patience:
+                    logger.info(f"早停触发，{training_config.patience}个epoch无改善")
+                    break
             
-            # 早停
-            if patience_counter >= training_config.early_stopping_patience:
-                logger.info(f"早停触发，在epoch {epoch+1}停止训练")
-                break
+            # 定期保存检查点
+            if (epoch + 1) % experiment_config.save_interval == 0:
+                save_checkpoint(model, optimizer, epoch, val_loss, val_metrics['accuracy'], 
+                              experiment_config.checkpoint_dir, f"epoch_{epoch+1}")
+            
+            # 打印梯度监控建议
+            if epoch % 5 == 0:  # 每5个epoch打印一次
+                recommendations = gradient_monitor.get_recommendations()
+                if recommendations:
+                    logger.info("梯度监控建议:")
+                    for rec in recommendations:
+                        logger.info(f"  - {rec}")
         
         # 测试最佳模型
         logger.info("加载最佳模型进行测试...")
-        checkpoint = torch.load(checkpoint_dir / "best_model.pth", map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        checkpoint_dir = Path(experiment_config.checkpoint_dir)
+        best_checkpoint_path = checkpoint_dir / "best_model.pth"
         
-        test_metrics = validate_epoch(model, test_loader, criterion, device)
-        logger.info(f"测试结果 - Loss: {test_metrics['loss']:.4f}, Accuracy: {test_metrics['accuracy']:.2f}%, F1: {test_metrics['f1_macro']:.4f}")
+        if best_checkpoint_path.exists():
+            epoch, score = load_checkpoint(model, optimizer, best_checkpoint_path)
+            logger.info(f"加载最佳模型检查点: epoch {epoch}, score {score}")
+        else:
+            logger.warning(f"最佳模型检查点文件不存在: {best_checkpoint_path}")
+            # 尝试加载最新的检查点
+            epoch_checkpoints = list(checkpoint_dir.glob("epoch_*_model.pth"))
+            if epoch_checkpoints:
+                latest_checkpoint_path = sorted(epoch_checkpoints)[-1]
+                epoch, score = load_checkpoint(model, optimizer, latest_checkpoint_path)
+                logger.info(f"加载最新的检查点: {latest_checkpoint_path}")
+            else:
+                logger.warning("没有找到任何检查点文件，使用当前模型进行测试")
         
-        # 保存处理后的数据
-        processor.save_processed_data("processed_data")
+        test_loss, test_metrics = validate_epoch(model, test_loader, criterion, device, epoch)
+        logger.info(f"测试结果 - Loss: {test_metrics['loss']:.4f}, Accuracy: {test_metrics['accuracy']:.2f}%")
         
-        logger.info("训练完成！")
+        # 保存测试结果
+        results = {
+            'test_loss': test_metrics['loss'],
+            'test_accuracy': test_metrics['accuracy'],
+            'best_val_score': best_val_score,
+            'final_epoch': epoch,
+            'training_config': training_config,
+            'model_config': model_config,
+            'data_config': data_config
+        }
+        
+        # 保存结果
+        results_path = Path(experiment_config.results_dir)
+        results_path.mkdir(parents=True, exist_ok=True)
+        
+        with open(results_path / "training_results.pkl", "wb") as f:
+            pickle.dump(results, f)
+        
+        logger.info("训练完成！结果已保存")
         
     except Exception as e:
         logger.error(f"训练过程中发生错误: {e}")

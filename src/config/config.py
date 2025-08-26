@@ -25,26 +25,38 @@ class ModelConfig:
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 64
-    epochs: int = 30
-    learning_rate: float = 1e-5
+    """训练配置"""
+    
+    # 基本训练参数
+    epochs: int = 100
+    batch_size: int = 32
+    learning_rate: float = 1e-3
     weight_decay: float = 1e-4
-    optimizer: str = "adamw"     # "adamw", "adam", "sgd"
-    scheduler: str = "cosine_warmup"    # "cosine", "cosine_warmup", "onecycle", "none"
-    use_amp: bool = True
-    grad_clip: float = 1.0
-    early_stopping_patience: int = 8
-    monitor: str = "val_f1_macro"   # key in validation metrics
-    monitor_mode: str = "max"
-    betas: Tuple[float, float] = (0.9, 0.999)
+    
+    # 优化器配置
+    optimizer: str = "adamw"  # "adam", "adamw", "sgd"
     
     # 学习率调度器配置
+    scheduler: str = "cosine"  # "cosine", "cosine_warmup", "onecycle", "none"
     warmup_epochs: int = 5
-    min_lr_factor: float = 0.01  # 最小学习率 = learning_rate * min_lr_factor
+    min_lr_factor: float = 0.01
     
-    # EMA配置
-    use_ema: bool = True
-    ema_decay: float = 0.9999
+    # 早停配置
+    patience: int = 8  # 早停耐心值
+    early_stopping_patience: int = 8  # 保持向后兼容
+    
+    # 混合精度训练
+    use_amp: bool = True
+    
+    # 梯度累积
+    gradient_accumulation_steps: int = 1
+    
+    # 数据增强
+    use_data_augmentation: bool = True
+    
+    # 监控指标
+    monitor: str = "accuracy"  # 监控的指标
+    monitor_mode: str = "max"  # "max" 或 "min"
 
 @dataclass
 class DataConfig:
@@ -93,9 +105,35 @@ class DataConfig:
 
 @dataclass
 class ExperimentConfig:
-    device: str = "auto"
-    num_workers: int = 4  # 默认使用4个工作进程，Windows用户可以通过命令行参数设为0
-    pin_memory: bool = True
-    log_dir: str = "logs"
-    checkpoint_dir: str = "checkpoints"
+    """实验配置"""
+    
+    # 设备配置
+    device: str = "auto"  # "auto", "cuda", "cpu"
+    
+    # 随机种子
     seed: int = 42
+    
+    # 数据加载器配置
+    num_workers: int = 0  # Windows用户建议设为0
+    pin_memory: bool = True
+    
+    # 日志配置
+    log_dir: str = "logs"
+    
+    # 检查点配置
+    checkpoint_dir: str = "checkpoints"
+    save_interval: int = 5  # 每N个epoch保存一次检查点
+    
+    # 结果配置
+    results_dir: str = "results"
+    
+    # 实验名称
+    experiment_name: str = "multi_stock_cnn_lstm"
+    
+    # 是否启用TensorBoard
+    use_tensorboard: bool = False
+    
+    # 是否启用WandB
+    use_wandb: bool = False
+    wandb_project: str = "stock_cnn_lstm"
+    wandb_entity: str = ""
